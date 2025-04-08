@@ -9,8 +9,9 @@ from langchain_core.messages import HumanMessage,AIMessage,SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from typing_extensions import Annotated, TypedDict
+from typing_extensions import Annotated, TypedDict, List
 from langchain_core.messages import BaseMessage
+from langchain_core.documents import Document
 from langgraph.graph.message import add_messages
 from langchain_core.messages import SystemMessage, trim_messages
 from langchain.tools import Tool, tool # Use the decorator for simplicity
@@ -25,7 +26,43 @@ from langchain import hub
 from langchain_community.utilities import SQLDatabase
 from pinecone import Pinecone, ServerlessSpec
 from langchain_pinecone import PineconeVectorStore
+from sentence_transformers import SentenceTransformer
 
+EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+EMBEDDING_DIMENSION = 384 
+EMBEDDING_MODEL = EMBEDDING_MODEL_NAME
+EMBEDDING_DIM = EMBEDDING_DIMENSION
+
+index = os.environ.get('PINECONE_INDEX_NAME')
+
+def init_pinecone():
+    api_key = os.environ.get('PINECONE_API_KEY')
+    environment = os.environ.get('PINECONE_ENVIRONMENT')
+    if not api_key or not environment:
+        print("Pinecone API Key or Environment not configured.")
+        return None
+    try:
+        Pinecone.init(api_key=api_key, environment=environment)
+        return Pinecone
+    except Exception as e:
+        print(f"Failed to initialize Pinecone: {e}")
+        return None
+
+# Load Embedding Model (cache it)
+# Consider loading this once globally or using a caching mechanism
+embeddings = None
+def get_embedding_model():
+    global embeddings
+    if embeddings is None:
+        model_name = os.environ['EMBEDDING_MODEL']
+        print(f"Loading embedding model: {model_name}")
+        try:
+            embeddings = SentenceTransformer(model_name)
+            print("Embedding model loaded.")
+        except Exception as e:
+            print(f"Error loading embedding model {model_name}: {e}")
+            raise e # Re-raise if model loading fails critically
+    return embeddings
 vector_store = PineconeVectorStore(index=index, embedding=embeddings)
 
 if not os.getenv("PINECONE_API_KEY"):
@@ -53,6 +90,14 @@ llm = ChatTogether(
     model="deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free",
 )
 
+class MessagesState(TypedDict):
+    language: str
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    question: str
+    context: List[Document]
+    query: str
+    result: str
+    answer: str
 messages_store = {}
 prompt_template = ChatPromptTemplate.from_messages(
     [
@@ -63,8 +108,7 @@ prompt_template = ChatPromptTemplate.from_messages(
         MessagesPlaceholder(variable_name="messages"),
     ]
 )
-# Define a new graph
-workflow = StateGraph(state_schema=MessagesState)
+
 
 
 # Define the function that calls the model
@@ -74,6 +118,42 @@ def call_model(state: MessagesState):
     )
     response = llm.invoke(prompt)
     return {"messages": response}
+
+def tavily_web_search(query: str) -> list[str]:
+    results = search.results(query)
+    return [result['content'] for result in results if 'content' in result]
+
+class QueryOutput(TypedDict):
+    """Generated SQL query."""
+
+    query: Annotated[str, ..., "Syntactically valid SQL query."]
+
+prompt = hub.pull("rlm/rag-prompt")
+
+def retrieve(state: MessagesState):
+    retrieved_docs = vector_store.similarity_search(state["question"])
+    return {"context": retrieved_docs}
+
+
+def generate(state: MessagesState):
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+def write_query(state: MessagesState):
+    """Generate SQL query to fetch information."""
+    prompt = query_prompt_template.invoke(
+        {
+            "dialect": db.dialect,
+            "top_k": 10,
+            "table_info": db.get_table_info(),
+            "input": state["question"],
+        }
+    )
+    structured_llm = llm.with_structured_output(QueryOutput)
+    result = structured_llm.invoke(prompt)
+    return {"query": result["query"]}
 
 def execute_query(state: MessagesState):
     """Execute SQL query."""
@@ -92,58 +172,38 @@ def generate_answer(state: MessagesState):
     response = llm.invoke(prompt)
     return {"answer": response.content}
 
-def tavily_web_search(query: str) -> list[str]:
-    results = search.results(query)
-    return [result['content'] for result in results if 'content' in result]
-
-class QueryOutput(TypedDict):
-    """Generated SQL query."""
-
-    query: Annotated[str, ..., "Syntactically valid SQL query."]
-
-
-def write_query(state: MessagesState):
-    """Generate SQL query to fetch information."""
-    prompt = query_prompt_template.invoke(
-        {
-            "dialect": db.dialect,
-            "top_k": 10,
-            "table_info": db.get_table_info(),
-            "input": state["question"],
-        }
+def decide_sql_or_rag(state: dict) -> dict:
+    decision_prompt = (
+        "Classify the following question as either 'SQL' if it's structured and suited for database queries, "
+        "or 'RAG' if it's more general or unstructured:\n\n"
+        f"Question: {state['question']}"
     )
-    structured_llm = llm.with_structured_output(QueryOutput)
-    result = structured_llm.invoke(prompt)
-    return {"query": result["query"]}
+    decision = llm.invoke(decision_prompt).strip().upper()
+    if decision not in {"SQL", "RAG"}:
+        decision = "RAG"
+    return {"route": decision}
 
-class PineconeQueryInput(BaseModel):
-    query: str = Field(description="The user's question or topic to search for in the text documents.")
+def check_rag_context(state: dict) -> str:
+    context = state.get("context", [])
+    if not context or all(len(doc.page_content) < 100 for doc in context):
+        return "to_web"
+    return "to_rag_answer"
 
-class SQLQueryInput(BaseModel):
-    sql_query: str = Field(description="A valid and safe PostgreSQL SELECT query to execute against the relevant table(s). Query ONLY the 'uploaded_tabular_data' table, filtering by 'upload_id' and 'row_index' or querying the 'row_data' JSONB column.")
-
-class ProposeWriteInput(BaseModel):
-    target_upload_id: int = Field(description="The specific ID of the tabular data upload to modify.")
-    write_request: str = Field(description="A detailed natural language description of the data to be inserted, updated, or deleted. Include specific values and conditions.")
-
-# Define the (single) node in the graph
+# Define a new graph
+workflow = StateGraph(state_schema=MessagesState)
 workflow.add_sequence(
     [write_query, execute_query, generate_answer]
 )
+workflow.add_sequence([retrieve, generate])
 workflow.add_edge(START, "model")
 workflow.add_node("model", call_model)
+
 
 # Add memory
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 
-class MessagesState(TypedDict):
-    language: str
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    question: str
-    query: str
-    result: str
-    answer: str
+
 
 
 def conversational_rag_chain(input, id):
