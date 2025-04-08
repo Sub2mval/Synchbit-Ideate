@@ -15,10 +15,30 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import SystemMessage, trim_messages
 from langchain.tools import Tool, tool # Use the decorator for simplicity
 from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_community.utilities import SQLDatabase
 import getpass
 import os
 from dotenv import load_dotenv
 from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
+from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
+from langchain import hub
+from langchain_community.utilities import SQLDatabase
+from pinecone import Pinecone, ServerlessSpec
+from langchain_pinecone import PineconeVectorStore
+
+vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+
+if not os.getenv("PINECONE_API_KEY"):
+    os.environ["PINECONE_API_KEY"] = getpass.getpass("Enter your Pinecone API key: ")
+
+pinecone_api_key = os.environ.get("PINECONE_API_KEY")
+
+pc = Pinecone(api_key=pinecone_api_key)
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+db = SQLDatabase.from_uri(DATABASE_URL)
+
+query_prompt_template = hub.pull("langchain-ai/sql-query-system-prompt")
 
 # Initialize the Tavily API wrapper
 search = TavilySearchAPIWrapper(max_results=5)
@@ -55,9 +75,46 @@ def call_model(state: MessagesState):
     response = llm.invoke(prompt)
     return {"messages": response}
 
+def execute_query(state: MessagesState):
+    """Execute SQL query."""
+    execute_query_tool = QuerySQLDatabaseTool(db=db)
+    return {"result": execute_query_tool.invoke(state["query"])}
+
+def generate_answer(state: MessagesState):
+    """Answer question using retrieved information as context."""
+    prompt = (
+        "Given the following user question, corresponding SQL query, "
+        "and SQL result, answer the user question.\n\n"
+        f'Question: {state["question"]}\n'
+        f'SQL Query: {state["query"]}\n'
+        f'SQL Result: {state["result"]}'
+    )
+    response = llm.invoke(prompt)
+    return {"answer": response.content}
+
 def tavily_web_search(query: str) -> list[str]:
     results = search.results(query)
     return [result['content'] for result in results if 'content' in result]
+
+class QueryOutput(TypedDict):
+    """Generated SQL query."""
+
+    query: Annotated[str, ..., "Syntactically valid SQL query."]
+
+
+def write_query(state: MessagesState):
+    """Generate SQL query to fetch information."""
+    prompt = query_prompt_template.invoke(
+        {
+            "dialect": db.dialect,
+            "top_k": 10,
+            "table_info": db.get_table_info(),
+            "input": state["question"],
+        }
+    )
+    structured_llm = llm.with_structured_output(QueryOutput)
+    result = structured_llm.invoke(prompt)
+    return {"query": result["query"]}
 
 class PineconeQueryInput(BaseModel):
     query: str = Field(description="The user's question or topic to search for in the text documents.")
@@ -70,6 +127,9 @@ class ProposeWriteInput(BaseModel):
     write_request: str = Field(description="A detailed natural language description of the data to be inserted, updated, or deleted. Include specific values and conditions.")
 
 # Define the (single) node in the graph
+workflow.add_sequence(
+    [write_query, execute_query, generate_answer]
+)
 workflow.add_edge(START, "model")
 workflow.add_node("model", call_model)
 
@@ -80,6 +140,10 @@ app = workflow.compile(checkpointer=memory)
 class MessagesState(TypedDict):
     language: str
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    question: str
+    query: str
+    result: str
+    answer: str
 
 
 def conversational_rag_chain(input, id):
